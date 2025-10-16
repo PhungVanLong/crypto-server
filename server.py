@@ -17,6 +17,7 @@ BINANCE_WS = "wss://stream.binance.com:9443/stream"
 # ===========================
 
 latest_prices = {}
+daily_stats = {}  # Lưu open, close, change%
 subscribers = set()
 ws_tasks = {}
 
@@ -25,9 +26,12 @@ ws_tasks = {}
 
 async def ws_worker(symbol_group):
     """Worker kết nối Binance WebSocket cho 1 nhóm symbol."""
-    streams = "/".join(f"{s}@trade" for s in symbol_group)
+    # Kết hợp trade stream + 24hr ticker stream
+    trade_streams = "/".join(f"{s}@trade" for s in symbol_group)
+    ticker_streams = "/".join(f"{s}@ticker" for s in symbol_group)
+    streams = f"{trade_streams}/{ticker_streams}"
     url = f"{BINANCE_WS}?streams={streams}"
-    print(f"🔌 WS group: {url}")
+    print(f"🔌 WS group: {url[:100]}...")
 
     while True:
         try:
@@ -35,26 +39,67 @@ async def ws_worker(symbol_group):
                 async for msg in ws:
                     data = json.loads(msg)
                     payload = data.get("data", {})
-                    symbol = payload.get("s", "").lower()
-                    price = float(payload.get("p", 0))
-                    if not symbol or not price:
-                        continue
+                    event_type = payload.get("e")
+                    
+                    # Xử lý trade stream (giá realtime)
+                    if event_type == "trade":
+                        symbol = payload.get("s", "").lower()
+                        price = float(payload.get("p", 0))
+                        if not symbol or not price:
+                            continue
 
-                    old_price = latest_prices.get(symbol)
-                    if old_price != price:
-                        latest_prices[symbol] = price
-                        event = json.dumps({
-                            "timestamp": int(time.time()),
-                            "symbol": symbol,
-                            "price": price
-                        })
-                        # Gửi đến tất cả subscriber
-                        for q in list(subscribers):
-                            await q.put(event)
+                        old_price = latest_prices.get(symbol)
+                        if old_price != price:
+                            latest_prices[symbol] = price
+                            await broadcast_update(symbol, price)
+                    
+                    # Xử lý 24hr ticker (open, close, change%)
+                    elif event_type == "24hrTicker":
+                        symbol = payload.get("s", "").lower()
+                        open_price = float(payload.get("o", 0))
+                        close_price = float(payload.get("c", 0))
+                        price_change_percent = float(payload.get("P", 0))
+                        
+                        if symbol:
+                            daily_stats[symbol] = {
+                                "open": open_price,
+                                "close": close_price,
+                                "change_percent": price_change_percent
+                            }
+                            # Cập nhật giá hiện tại nếu có
+                            if close_price > 0:
+                                latest_prices[symbol] = close_price
+                                await broadcast_update(symbol, close_price)
+                                
         except Exception as e:
             print("⚠️ WS lỗi:", e)
             print("⏳ Reconnect sau 5s...")
             await asyncio.sleep(5)
+
+
+async def broadcast_update(symbol, price):
+    """Gửi update đến tất cả subscribers"""
+    stats = daily_stats.get(symbol, {})
+    event = json.dumps({
+        "timestamp": int(time.time()),
+        "symbol": symbol,
+        "price": price,
+        "open": stats.get("open", 0),
+        "close": stats.get("close", 0),
+        "change_percent": stats.get("change_percent", 0)
+    })
+    
+    # Gửi đến tất cả subscriber
+    dead_queues = []
+    for q in list(subscribers):
+        try:
+            await asyncio.wait_for(q.put(event), timeout=1)
+        except asyncio.TimeoutError:
+            dead_queues.append(q)
+    
+    # Dọn dẹp queue chết
+    for q in dead_queues:
+        subscribers.discard(q)
 
 
 async def start_ws_tasks(symbols):
@@ -91,7 +136,7 @@ async def sse_events(request: Request, symbols: str = Query(..., description="Co
     await start_ws_tasks(symbol_list)
 
     # Tạo hàng đợi SSE riêng
-    q = asyncio.Queue()
+    q = asyncio.Queue(maxsize=1000)
     subscribers.add(q)
     print(f"👥 Client kết nối, tổng: {len(subscribers)}")
 
@@ -126,5 +171,13 @@ def home():
     return {
         "message": "✅ Binance SSE server is running",
         "usage": "/events?symbols=btcusdt,ethusdt,bnbusdt",
-        "example": "/events?symbols=btc,eth"
+        "example": "/events?symbols=btcusdt,ethusdt",
+        "data_format": {
+            "timestamp": "Unix timestamp",
+            "symbol": "Symbol name",
+            "price": "Current price",
+            "open": "24h open price",
+            "close": "24h close price", 
+            "change_percent": "24h change %"
+        }
     }
